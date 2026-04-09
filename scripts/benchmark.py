@@ -258,7 +258,13 @@ def _parse_args() -> argparse.Namespace:
         metavar="N",
         help="Analyze score trends over the last N runs after benchmarking (requires ≥2 runs)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Validate --trend-window
+    if args.trend_window is not None and args.trend_window < 2:
+        parser.error("--trend-window must be >= 2")
+
+    return args
 
 
 def _select_task_ids(tasks: List[Task], suite: str) -> Optional[List[str]]:
@@ -841,13 +847,16 @@ def main():
     _log_efficiency_summary(efficiency, grades_by_task_id)
     # Run trend analysis if requested
     if args.trend_window is not None:
-        from lib_trend import RunTrendAnalyzer
+        try:
+            from lib_trend import RunTrendAnalyzer
 
-        analyzer = RunTrendAnalyzer(
-            results_dir=output_dir,
-            window=args.trend_window,
-        )
-        analyzer.run(model=args.model)
+            analyzer = RunTrendAnalyzer(
+                results_dir=output_dir,
+                window=args.trend_window,
+            )
+            analyzer.run(model=args.model)
+        except Exception as exc:
+            logger.warning("Trend analysis failed: %s", exc)
 
     if args.no_upload:
         logger.info("Skipping upload (--no-upload)")
