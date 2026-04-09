@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,9 +59,9 @@ def grade_task(
     if verbose:
         logger.info("   [VERBOSE] Grading task %s with type: %s", task.task_id, grading_type)
         logger.info("   [VERBOSE] Execution status: %s", execution_result.get("status", "unknown"))
-    
+
     if grading_type == "automated":
-        result = _grade_automated(task, execution_result, verbose=verbose)
+        result = _grade_automated(task, execution_result, skill_dir=skill_dir, verbose=verbose)
         if verbose:
             logger.info("   [VERBOSE] Automated grade breakdown: %s", result.breakdown)
         return result
@@ -79,7 +80,7 @@ def grade_task(
             logger.info("   [VERBOSE] LLM judge breakdown: %s", result.breakdown)
         return result
     if grading_type == "hybrid":
-        auto_result = _grade_automated(task, execution_result, verbose=verbose)
+        auto_result = _grade_automated(task, execution_result, skill_dir=skill_dir, verbose=verbose)
         llm_result = _grade_llm_judge(
             task=task,
             execution_result=execution_result,
@@ -94,7 +95,12 @@ def grade_task(
     raise ValueError(f"Unknown grading type: {grading_type}")
 
 
-def _grade_automated(task: Task, execution_result: Dict[str, Any], verbose: bool = False) -> GradeResult:
+def _grade_automated(
+    task: Task,
+    execution_result: Dict[str, Any],
+    skill_dir: Optional[Path] = None,
+    verbose: bool = False,
+) -> GradeResult:
     grading_code = _extract_grading_code(task)
     if not grading_code:
         return GradeResult(
@@ -106,7 +112,7 @@ def _grade_automated(task: Task, execution_result: Dict[str, Any], verbose: bool
             notes="No automated grading code found",
         )
 
-    namespace: Dict[str, Any] = {}
+    namespace = _build_automated_namespace(skill_dir)
     exec(grading_code, namespace)
     grade_func = namespace.get("grade")
     if not callable(grade_func):
@@ -125,7 +131,7 @@ def _grade_automated(task: Task, execution_result: Dict[str, Any], verbose: bool
     )
     if not isinstance(scores, dict):
         scores = {}
-    
+
     if verbose:
         logger.info("   [VERBOSE] Automated grading scores: %s", scores)
 
@@ -138,6 +144,37 @@ def _grade_automated(task: Task, execution_result: Dict[str, Any], verbose: bool
         breakdown=_normalize_score_dict(scores),
         notes="",
     )
+
+
+_PRIVATE_IMAGE_KEY_FILENAME = "image_classification_answer_key.json"
+_PRIVATE_IMAGE_KEY_RUNTIME_PATH = (
+    Path("/tmp/pinchbench/judge/private") / _PRIVATE_IMAGE_KEY_FILENAME
+)
+
+
+def _build_automated_namespace(skill_dir: Optional[Path]) -> Dict[str, Any]:
+    namespace: Dict[str, Any] = {}
+    private_key_path = _stage_private_image_key(skill_dir)
+    if private_key_path:
+        namespace["_PINCHBENCH_PRIVATE_IMAGE_KEY_PATH"] = private_key_path
+    return namespace
+
+
+def _stage_private_image_key(skill_dir: Optional[Path]) -> str:
+    if skill_dir is None:
+        return ""
+    source_key_path = skill_dir / "assets" / _PRIVATE_IMAGE_KEY_FILENAME
+    if not source_key_path.exists():
+        return ""
+
+    try:
+        _PRIVATE_IMAGE_KEY_RUNTIME_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _PRIVATE_IMAGE_KEY_RUNTIME_PATH.write_bytes(source_key_path.read_bytes())
+        os.chmod(_PRIVATE_IMAGE_KEY_RUNTIME_PATH, 0o600)
+        return str(_PRIVATE_IMAGE_KEY_RUNTIME_PATH)
+    except OSError as exc:
+        logger.warning("Failed to stage private image answer key: %s", exc)
+        return ""
 
 
 def _grade_llm_judge(
@@ -171,10 +208,16 @@ def _grade_llm_judge(
 
     transcript_summary = _summarize_transcript(transcript)
     if verbose:
-        logger.info("   [VERBOSE] Transcript summary for judge (first 1000 chars):\n%s", transcript_summary[:1000])
+        logger.info(
+            "   [VERBOSE] Transcript summary for judge (first 1000 chars):\n%s",
+            transcript_summary[:1000],
+        )
     workspace_content = _read_workspace_files(execution_result.get("workspace", ""))
     if verbose and workspace_content:
-        logger.info("   [VERBOSE] Workspace files passed to judge (first 500 chars):\n%s", workspace_content[:500])
+        logger.info(
+            "   [VERBOSE] Workspace files passed to judge (first 500 chars):\n%s",
+            workspace_content[:500],
+        )
     rubric = task.llm_judge_rubric or _format_grading_criteria(task)
     prompt = _build_judge_prompt(task, transcript_summary, rubric, workspace_content)
 
@@ -192,12 +235,15 @@ def _grade_llm_judge(
                 logger.info("   [VERBOSE] Judge error: %s", judge_result["error"])
 
         if judge_result.get("status") != "success":
-            logger.warning("Judge API call failed: %s", judge_result.get("error", judge_result.get("status")))
+            logger.warning(
+                "Judge API call failed: %s", judge_result.get("error", judge_result.get("status"))
+            )
 
         raw_parsed = _parse_judge_text(judge_result.get("text", ""))
     else:
         # Default: OpenClaw agent session
-        agent_id = _ensure_judge_agent(judge_agent_prefix, judge_model, skill_dir)
+        judge_skill_dir = skill_dir if skill_dir is not None else Path.cwd()
+        agent_id = _ensure_judge_agent(judge_agent_prefix, judge_model, judge_skill_dir)
         judge_workspace = Path(f"/tmp/pinchbench/judge/{task.task_id}")
         judge_result = run_openclaw_prompt(
             agent_id=agent_id,
@@ -218,12 +264,12 @@ def _grade_llm_judge(
 
     if verbose:
         logger.info("   [VERBOSE] Judge raw response parsed: %s", raw_parsed)
-    
+
     # Normalize the response to handle various formats (criteria_scores, score, justification, etc.)
     parsed = _normalize_judge_response(raw_parsed)
     if verbose:
         logger.info("   [VERBOSE] Normalized judge response: %s", parsed)
-    
+
     breakdown = parsed.get("scores", {})
     total = parsed.get("total")
     notes = parsed.get("notes", "")
@@ -312,9 +358,7 @@ def _summarize_transcript(transcript: List[Dict[str, Any]]) -> str:
                             truncated_args[k] = v[:200] + "...[truncated]"
                         else:
                             truncated_args[k] = v
-                    summary_parts.append(
-                        f"Tool: {item.get('name')}({json.dumps(truncated_args)})"
-                    )
+                    summary_parts.append(f"Tool: {item.get('name')}({json.dumps(truncated_args)})")
                 elif item.get("type") == "text":
                     text = item.get("text", "").strip()
                     if text:
@@ -339,8 +383,13 @@ def _read_workspace_files(workspace_path: str) -> str:
     if not workspace.exists():
         return ""
     skip_names = {
-        "BOOTSTRAP.md", "SOUL.md", "USER.md", "IDENTITY.md",
-        "HEARTBEAT.md", "TOOLS.md", "AGENTS.md",
+        "BOOTSTRAP.md",
+        "SOUL.md",
+        "USER.md",
+        "IDENTITY.md",
+        "HEARTBEAT.md",
+        "TOOLS.md",
+        "AGENTS.md",
     }
     skip_dirs = {".git", ".openclaw", "__pycache__", "node_modules", "skills"}
     file_contents: List[str] = []
@@ -361,13 +410,12 @@ def _read_workspace_files(workspace_path: str) -> str:
     return "\n\n".join(file_contents)
 
 
-def _build_judge_prompt(task: Task, transcript_summary: str, rubric: str, workspace_content: str = "") -> str:
+def _build_judge_prompt(
+    task: Task, transcript_summary: str, rubric: str, workspace_content: str = ""
+) -> str:
     workspace_section = ""
     if workspace_content.strip():
-        workspace_section = (
-            "## Workspace Files Created by Agent\n"
-            f"{workspace_content}\n\n"
-        )
+        workspace_section = f"## Workspace Files Created by Agent\n{workspace_content}\n\n"
     return (
         "You are a grading function. Your ONLY job is to output a single JSON object.\n\n"
         "CRITICAL RULES:\n"
@@ -477,10 +525,12 @@ def _parse_judge_response(transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
         try:
             total = float(score_pattern.group(1))
             if 0.0 <= total <= 1.0:
-                logger.warning(
-                    "Fell back to regex score extraction from prose (total=%.2f)", total
-                )
-                return {"scores": {}, "total": total, "notes": "Score extracted from prose (JSON parse failed)"}
+                logger.warning("Fell back to regex score extraction from prose (total=%.2f)", total)
+                return {
+                    "scores": {},
+                    "total": total,
+                    "notes": "Score extracted from prose (JSON parse failed)",
+                }
         except ValueError:
             pass
 
@@ -565,14 +615,14 @@ def _parse_judge_text(raw_text: str) -> Dict[str, Any]:
 def _normalize_judge_response(parsed: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize judge response to expected format with 'scores', 'total', and 'notes'.
-    
+
     Handles various response formats:
     - {"scores": {...}, "total": 0.9, "notes": "..."}  (expected)
     - {"criteria_scores": {...}, ...}  (Claude sometimes uses this)
     - {"score": 0.9, "justification": "..."}  (simplified format)
     """
     result: Dict[str, Any] = {"scores": {}, "total": None, "notes": ""}
-    
+
     # Extract scores from various keys
     if "scores" in parsed:
         scores_data = parsed["scores"]
@@ -580,7 +630,11 @@ def _normalize_judge_response(parsed: Dict[str, Any]) -> Dict[str, Any]:
             # Handle nested structure: {"criterion": {"score": 0.9, "weight": 0.3}}
             for key, value in scores_data.items():
                 if isinstance(value, dict) and "score" in value:
-                    result["scores"][key] = float(value["score"]) if isinstance(value["score"], (int, float, str)) else value["score"]
+                    result["scores"][key] = (
+                        float(value["score"])
+                        if isinstance(value["score"], (int, float, str))
+                        else value["score"]
+                    )
                 elif isinstance(value, (int, float)):
                     result["scores"][key] = value
     elif "criteria_scores" in parsed:
@@ -592,10 +646,12 @@ def _normalize_judge_response(parsed: Dict[str, Any]) -> Dict[str, Any]:
                     result["scores"][key] = value["score"]
                 elif isinstance(value, (int, float)):
                     result["scores"][key] = value
-    
+
     # Extract total score
     if "total" in parsed and parsed["total"] is not None:
-        result["total"] = float(parsed["total"]) if isinstance(parsed["total"], (int, float)) else None
+        result["total"] = (
+            float(parsed["total"]) if isinstance(parsed["total"], (int, float)) else None
+        )
     elif "score" in parsed and isinstance(parsed["score"], (int, float)):
         result["total"] = float(parsed["score"])
     elif "overall_score" in parsed and isinstance(parsed["overall_score"], (int, float)):
@@ -616,7 +672,7 @@ def _normalize_judge_response(parsed: Dict[str, Any]) -> Dict[str, Any]:
         and all(0.0 <= float(v) <= 1.0 for v in values)
     ):
         result["total"] = sum(values) / len(values)
-    
+
     # Extract notes/justification
     if "notes" in parsed:
         result["notes"] = str(parsed["notes"])
@@ -624,5 +680,5 @@ def _normalize_judge_response(parsed: Dict[str, Any]) -> Dict[str, Any]:
         result["notes"] = str(parsed["justification"])
     elif "reasoning" in parsed:
         result["notes"] = str(parsed["reasoning"])
-    
+
     return result
