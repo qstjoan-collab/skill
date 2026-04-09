@@ -1,5 +1,5 @@
 ---
-id: task_25_playwright_e2e
+id: task_26_playwright_e2e
 name: Playwright E2E Form Test
 category: automation
 grading_type: hybrid
@@ -144,24 +144,47 @@ def grade(transcript: list, workspace_path: str) -> dict:
     else:
         scores["references_form_html"] = 0.0
 
-    # Check for multiple field fills (at least 5 distinct interactions)
-    fill_patterns = [
-        r'\.fill\s*\(',
-        r'\.type\s*\(',
-        r'\.select_option\s*\(',
-        r'\.check\s*\(',
-        r'\.click\s*\(',
-        r'\.press\s*\(',
-    ]
-    fill_count = sum(len(re.findall(p, content)) for p in fill_patterns)
-    if fill_count >= 10:
-        scores["fills_multiple_fields"] = 1.0
-    elif fill_count >= 5:
-        scores["fills_multiple_fields"] = 0.75
-    elif fill_count >= 3:
-        scores["fills_multiple_fields"] = 0.5
-    else:
-        scores["fills_multiple_fields"] = 0.0
+    # Check for multiple field fills using AST to count actual method calls
+    # This avoids penalizing DRY code with helper functions
+    try:
+        tree = ast.parse(content)
+        fill_methods = {'fill', 'type', 'select_option', 'check', 'click', 'press'}
+        fill_calls = []
+        
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                # Handle method calls (obj.fill(), obj.type(), etc.)
+                if isinstance(node.func, ast.Attribute) and node.func.attr in fill_methods:
+                    fill_calls.append(node.func.attr)
+        
+        fill_count = len(fill_calls)
+        if fill_count >= 10:
+            scores["fills_multiple_fields"] = 1.0
+        elif fill_count >= 5:
+            scores["fills_multiple_fields"] = 0.75
+        elif fill_count >= 3:
+            scores["fills_multiple_fields"] = 0.5
+        else:
+            scores["fills_multiple_fields"] = 0.0
+    except Exception:
+        # Fall back to regex if AST parsing fails
+        fill_patterns = [
+            r'\.fill\s*\(',
+            r'\.type\s*\(',
+            r'\.select_option\s*\(',
+            r'\.check\s*\(',
+            r'\.click\s*\(',
+            r'\.press\s*\(',
+        ]
+        fill_count = sum(len(re.findall(p, content)) for p in fill_patterns)
+        if fill_count >= 10:
+            scores["fills_multiple_fields"] = 1.0
+        elif fill_count >= 5:
+            scores["fills_multiple_fields"] = 0.75
+        elif fill_count >= 3:
+            scores["fills_multiple_fields"] = 0.5
+        else:
+            scores["fills_multiple_fields"] = 0.0
 
     # Check for retry or wait logic
     retry_patterns = [
