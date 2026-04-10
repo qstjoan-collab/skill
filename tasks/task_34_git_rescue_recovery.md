@@ -111,6 +111,8 @@ def grade(transcript: list, workspace_path: str) -> dict:
         before_main = run("git rev-parse main").stdout.strip()
         base_commit = run("git rev-parse HEAD~2").stdout.strip()
         misplaced_commits = run("git rev-list --reverse HEAD~2..HEAD").stdout.splitlines()
+        # Capture original commit messages before agent runs (for cherry-pick validation)
+        original_messages = run("git log --format=%s --reverse HEAD~2..HEAD").stdout.strip().splitlines()
         if not before_main or not base_commit or len(misplaced_commits) != 2:
             return scores
 
@@ -137,10 +139,13 @@ def grade(transcript: list, workspace_path: str) -> dict:
         if new_main.returncode == 0 and new_main.stdout.strip() == base_commit:
             scores["main_reset_correctly"] = 1.0
 
-        feature_history = run("git rev-list --reverse feature/login-fix")
-        if feature_history.returncode == 0:
-            feature_commits = feature_history.stdout.splitlines()
-            if len(feature_commits) >= 3 and feature_commits[-2:] == misplaced_commits:
+        # Check commit messages instead of hashes to accept cherry-pick solutions
+        # (cherry-pick creates new commits with different hashes but same content)
+        feature_log = run("git log --format=%s --reverse feature/login-fix")
+        if feature_log.returncode == 0:
+            feature_messages = feature_log.stdout.strip().splitlines()
+            # Last 2 messages on feature branch should match original misplaced commits
+            if len(feature_messages) >= 2 and feature_messages[-2:] == original_messages:
                 scores["commits_preserved_on_feature"] = 1.0
 
         status = run("git status --porcelain")
