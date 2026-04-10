@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_JUDGE_MODEL = "openrouter/anthropic/claude-opus-4.5"
 DEFAULT_JUDGE_AGENT_PREFIX = "bench-judge"
-DEFAULT_JUDGE_TIMEOUT_SECONDS = 180
+DEFAULT_JUDGE_TIMEOUT_SECONDS = 300
 
 
 @dataclass
@@ -221,46 +222,65 @@ def _grade_llm_judge(
     rubric = task.llm_judge_rubric or _format_grading_criteria(task)
     prompt = _build_judge_prompt(task, transcript_summary, rubric, workspace_content)
 
-    if judge_backend == "api":
-        # Direct API call — bypasses OpenClaw personality injection
-        judge_result = call_judge_api(
-            prompt=prompt,
-            model=judge_model,
-            timeout_seconds=judge_timeout_seconds,
-        )
-
-        if verbose:
-            logger.info("   [VERBOSE] Judge execution status: %s", judge_result.get("status"))
-            if judge_result.get("error"):
-                logger.info("   [VERBOSE] Judge error: %s", judge_result["error"])
-
-        if judge_result.get("status") != "success":
-            logger.warning(
-                "Judge API call failed: %s", judge_result.get("error", judge_result.get("status"))
+    max_judge_attempts = 2
+    raw_parsed: Dict[str, Any] = {}
+    for attempt in range(max_judge_attempts):
+        if judge_backend == "api":
+            # Direct API call — bypasses OpenClaw personality injection
+            judge_result = call_judge_api(
+                prompt=prompt,
+                model=judge_model,
+                timeout_seconds=judge_timeout_seconds,
             )
 
-        raw_parsed = _parse_judge_text(judge_result.get("text", ""))
-    else:
-        # Default: OpenClaw agent session
-        judge_skill_dir = skill_dir if skill_dir is not None else Path.cwd()
-        agent_id = _ensure_judge_agent(judge_agent_prefix, judge_model, judge_skill_dir)
-        judge_workspace = Path(f"/tmp/pinchbench/judge/{task.task_id}")
-        judge_result = run_openclaw_prompt(
-            agent_id=agent_id,
-            prompt=prompt,
-            workspace=judge_workspace,
-            timeout_seconds=judge_timeout_seconds,
-        )
+            if verbose:
+                logger.info("   [VERBOSE] Judge execution status: %s", judge_result.get("status"))
+                if judge_result.get("error"):
+                    logger.info("   [VERBOSE] Judge error: %s", judge_result["error"])
 
-        if verbose:
-            logger.info("   [VERBOSE] Judge execution status: %s", judge_result.get("status"))
-            logger.info("   [VERBOSE] Judge exit code: %s", judge_result.get("exit_code"))
-            logger.info("   [VERBOSE] Judge stderr: %s", judge_result.get("stderr", "")[:500])
+            if judge_result.get("status") != "success":
+                logger.warning(
+                    "Judge API call failed (attempt %d/%d): %s",
+                    attempt + 1,
+                    max_judge_attempts,
+                    judge_result.get("error", judge_result.get("status")),
+                )
+                if attempt < max_judge_attempts - 1:
+                    time.sleep(2**attempt)
+                    continue
 
-        if judge_result.get("status") != "success":
-            logger.warning("Judge execution failed: %s", judge_result.get("status"))
+            raw_parsed = _parse_judge_text(judge_result.get("text", ""))
+        else:
+            # Default: OpenClaw agent session
+            judge_skill_dir = skill_dir if skill_dir is not None else Path.cwd()
+            agent_id = _ensure_judge_agent(judge_agent_prefix, judge_model, judge_skill_dir)
+            judge_workspace = Path(f"/tmp/pinchbench/judge/{task.task_id}")
+            judge_result = run_openclaw_prompt(
+                agent_id=agent_id,
+                prompt=prompt,
+                workspace=judge_workspace,
+                timeout_seconds=judge_timeout_seconds,
+            )
 
-        raw_parsed = _parse_judge_response(judge_result.get("transcript", []))
+            if verbose:
+                logger.info("   [VERBOSE] Judge execution status: %s", judge_result.get("status"))
+                logger.info("   [VERBOSE] Judge exit code: %s", judge_result.get("exit_code"))
+                logger.info("   [VERBOSE] Judge stderr: %s", judge_result.get("stderr", "")[:500])
+
+            if judge_result.get("status") != "success":
+                logger.warning(
+                    "Judge execution failed (attempt %d/%d): %s",
+                    attempt + 1,
+                    max_judge_attempts,
+                    judge_result.get("status"),
+                )
+                if attempt < max_judge_attempts - 1:
+                    time.sleep(2**attempt)
+                    continue
+
+            raw_parsed = _parse_judge_response(judge_result.get("transcript", []))
+
+        break  # Parsed response; exit loop after success or after the final failed attempt
 
     if verbose:
         logger.info("   [VERBOSE] Judge raw response parsed: %s", raw_parsed)
