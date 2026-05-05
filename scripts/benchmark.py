@@ -18,10 +18,13 @@ import json
 import logging
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -33,7 +36,15 @@ from lib_agent import (
     slugify_model,
     validate_openrouter_model,
 )
-from lib_grading import GradeResult, grade_task
+from lib_axiom import init_axiom
+from lib_grading import (
+    DEFAULT_JUDGE_TIMEOUT_SECONDS,
+    GradeResult,
+    grade_task,
+    set_judge_cache_dir,
+    get_judge_cache_stats,
+    clear_judge_cache,
+)
 from lib_tasks import Task, TaskLoader
 
 
@@ -184,6 +195,11 @@ def _parse_args() -> argparse.Namespace:
         help='Tasks to run: "all", "automated-only", a category name (e.g. "coding"), or comma-separated task IDs',
     )
     parser.add_argument(
+        "--core",
+        action="store_true",
+        help="Run only core tasks (~25 representative tasks for quick benchmarking)",
+    )
+    parser.add_argument(
         "--output-dir",
         default="results",
         help="Results directory",
@@ -251,6 +267,21 @@ def _parse_args() -> argparse.Namespace:
         "--no-fail-fast",
         action="store_true",
         help="Continue running all tasks even if sanity check scores 0%%",
+    )
+    parser.add_argument(
+        "--no-parallel-judge",
+        action="store_true",
+        help="Disable parallel judge execution (grade synchronously after each task)",
+    )
+    parser.add_argument(
+        "--no-judge-cache",
+        action="store_true",
+        help="Disable judge result caching (re-grade even if transcript+rubric unchanged)",
+    )
+    parser.add_argument(
+        "--clear-judge-cache",
+        action="store_true",
+        help="Clear the judge cache before running",
     )
     parser.add_argument(
         "--trend",
@@ -645,6 +676,34 @@ def _log_category_summary(
     return category_scores
 
 
+def _snapshot_workspace_for_grading(execution_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Snapshot the workspace directory so a background grader reads stable files.
+
+    When parallel grading is enabled, the main thread moves on to the next task
+    and calls ``prepare_task_workspace`` which wipes and rebuilds the shared
+    agent workspace.  If the background grader reads the live workspace it will
+    see the *next* task's files instead of the current one's.
+
+    This function copies the workspace tree into an isolated temp directory and
+    returns a shallow copy of *execution_result* whose ``workspace`` key points
+    to the snapshot.  The caller is responsible for cleaning up the temp
+    directory once grading is complete.
+    """
+    workspace_path = execution_result.get("workspace", "")
+    snapshot_result = dict(execution_result)  # shallow copy
+
+    if workspace_path:
+        src = Path(workspace_path)
+        if src.exists() and src.is_dir():
+            snapshot_dir = tempfile.mkdtemp(prefix="pinchbench_grade_snapshot_")
+            shutil.copytree(src, Path(snapshot_dir) / "workspace", dirs_exist_ok=True)
+            snapshot_result["workspace"] = str(Path(snapshot_dir) / "workspace")
+            # Stash the root temp dir so we can clean it up later
+            snapshot_result["_snapshot_tmpdir"] = snapshot_dir
+
+    return snapshot_result
+
+
 def main():
     """Main entry point for the benchmark script."""
     # Determine tasks directory
@@ -704,6 +763,16 @@ def main():
             logger.error("Upload failed: %s", exc)
             sys.exit(1)
 
+    # Initialize judge cache
+    if not args.no_judge_cache:
+        cache_dir = Path(args.output_dir) / ".judge_cache"
+        set_judge_cache_dir(cache_dir)
+        if args.clear_judge_cache:
+            clear_judge_cache()
+            logger.info("🗑️  Judge cache cleared")
+    else:
+        logger.info("📦 Judge caching disabled")
+    
     logger.info("🔧 Initializing BenchmarkRunner...")
     runner = BenchmarkRunner(tasks_dir)
 
@@ -738,6 +807,16 @@ def main():
     cleanup_agent_sessions(agent_id)
 
     task_ids = _select_task_ids(runner.tasks, args.suite, runner.task_loader.category_map)
+    
+    # Handle --core flag: use core tasks from manifest
+    if args.core:
+        core_task_ids = runner.task_loader.core_tasks
+        if not core_task_ids:
+            logger.warning("⚠️  No core tasks defined in manifest.yaml, running all tasks")
+        else:
+            task_ids = core_task_ids
+            logger.info(f"🎯 Core mode: running {len(core_task_ids)} representative tasks")
+    
     results = []
     grades_by_task_id = {}
     sanity_task_id = "task_sanity"
@@ -747,6 +826,14 @@ def main():
         tasks_map = {task.task_id: task for task in runner.tasks}
         tasks_to_run = [tasks_map[tid] for tid in task_ids if tid in tasks_map]
     tasks_by_id = {task.task_id: task for task in tasks_to_run}
+
+    # Initialize Axiom logging (silently no-ops if AXIOM_API_TOKEN not set)
+    axiom = init_axiom(
+        run_id=run_id,
+        model=args.model,
+        benchmark_version=_get_benchmark_version(skill_root),
+    )
+    axiom.run_start(total_tasks=len(tasks_to_run), suite=args.suite)
 
     runs_per_task = max(1, args.runs)
 
@@ -800,7 +887,89 @@ def main():
         except OSError:
             pass
 
+    # Parallel judge execution: grade previous task while current task runs
+    use_parallel_judge = not args.no_parallel_judge
+    judge_executor: Optional[ThreadPoolExecutor] = None
+    pending_grade_future: Optional[Future] = None
+    pending_grade_task: Optional[Task] = None
+    pending_grade_result: Optional[Dict[str, Any]] = None
+    pending_grade_task_num: int = 0
+    pending_grade_snapshot_dir: Optional[str] = None  # temp dir to clean up after grading
+
+    if use_parallel_judge:
+        judge_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge")
+        logger.info("Parallel judge execution enabled")
+
+    def _wait_for_pending_grade() -> None:
+        """Wait for any pending background grade to complete and record it."""
+        nonlocal pending_grade_future, pending_grade_task, pending_grade_result, pending_grade_task_num, pending_grade_snapshot_dir
+        if pending_grade_future is None:
+            return
+
+        try:
+            grade = pending_grade_future.result(timeout=DEFAULT_JUDGE_TIMEOUT_SECONDS)
+        except Exception as exc:
+            logger.warning("Background grading failed for %s: %s", pending_grade_task.task_id, exc)
+            grade = GradeResult(
+                task_id=pending_grade_task.task_id,
+                score=0.0,
+                max_score=1.0,
+                grading_type=pending_grade_task.grading_type,
+                breakdown={},
+                notes=f"Background grading failed: {exc}",
+            )
+
+        # Log the grade
+        score_pct = grade.score / grade.max_score * 100 if grade.max_score > 0 else 0
+        status_emoji = "✅" if grade.score >= grade.max_score else "⚠️" if grade.score > 0 else "❌"
+        logger.info(
+            "%s Task %s: %.1f/%.1f (%.0f%%) - %s [background]",
+            status_emoji,
+            pending_grade_task.task_id,
+            grade.score,
+            grade.max_score,
+            score_pct,
+            grade.grading_type,
+        )
+        if grade.notes:
+            logger.info("   Notes: %s", grade.notes[:200])
+
+        # Log to Axiom
+        axiom.task_complete(
+            task_id=pending_grade_task.task_id,
+            task_num=pending_grade_task_num,
+            total_tasks=len(tasks_to_run),
+            score=grade.score,
+            max_score=grade.max_score,
+            grading_type=grade.grading_type,
+            execution_time_sec=pending_grade_result.get("execution_time", 0.0),
+            timed_out=pending_grade_result.get("timed_out", False),
+        )
+
+        # Record the grade
+        task_scores = [grade.score]
+        grades_by_task_id[pending_grade_task.task_id] = {
+            "runs": [grade.to_dict()],
+            "mean": statistics.mean(task_scores),
+            "std": 0.0,
+            "min": min(task_scores),
+            "max": max(task_scores),
+        }
+
+        # Clean up workspace snapshot temp directory
+        if pending_grade_snapshot_dir:
+            shutil.rmtree(pending_grade_snapshot_dir, ignore_errors=True)
+            pending_grade_snapshot_dir = None
+
+        pending_grade_future = None
+        pending_grade_task = None
+        pending_grade_result = None
+
     for i, task in enumerate(tasks_to_run, 1):
+        # Wait for previous task's background grade before starting new task
+        # (we need to record its results before they get overwritten)
+        _wait_for_pending_grade()
+
         task_grades = []
         task_results = []
         for run_index in range(runs_per_task):
@@ -841,48 +1010,116 @@ def main():
                     "stdout": "",
                     "stderr": execution_error,
                 }
-            try:
-                grade_kwargs = dict(
-                    task=task, execution_result=result, skill_dir=skill_dir, verbose=args.verbose
-                )
-                if args.judge:
-                    grade_kwargs["judge_model"] = args.judge
-                    grade_kwargs["judge_backend"] = "api"
-                grade = grade_task(**grade_kwargs)
-            except Exception as exc:
-                if execution_error:
-                    note = f"Execution failed: {execution_error}; Grading failed: {exc}"
-                else:
-                    note = f"Grading failed: {exc}"
-                logger.warning("Task grading failed for %s, continuing: %s", task.task_id, exc)
-                grade = GradeResult(
-                    task_id=task.task_id,
-                    score=0.0,
-                    max_score=1.0,
-                    grading_type=task.grading_type,
-                    breakdown={},
-                    notes=note,
-                )
-            task_grades.append(grade)
+
             task_results.append(result)
             results.append(result)
 
-            # Log score immediately after grading
-            score_pct = grade.score / grade.max_score * 100 if grade.max_score > 0 else 0
-            status_emoji = (
-                "✅" if grade.score >= grade.max_score else "⚠️" if grade.score > 0 else "❌"
+            # Build grade kwargs for this run
+            grade_kwargs = dict(
+                task=task, execution_result=result, skill_dir=skill_dir, verbose=args.verbose
             )
-            logger.info(
-                "%s Task %s: %.1f/%.1f (%.0f%%) - %s",
-                status_emoji,
-                task.task_id,
-                grade.score,
-                grade.max_score,
-                score_pct,
-                grade.grading_type,
+            if args.judge:
+                grade_kwargs["judge_model"] = args.judge
+                grade_kwargs["judge_backend"] = "api"
+
+            # Parallel grading: submit to background if enabled and single run
+            # For multi-run tasks, grade synchronously to maintain order
+            is_last_task = (i == len(tasks_to_run))
+            can_parallelize = (
+                use_parallel_judge
+                and judge_executor is not None
+                and runs_per_task == 1
+                and not is_last_task
             )
-            if grade.notes:
-                logger.info("   Notes: %s", grade.notes[:200])
+
+            if can_parallelize:
+                # Snapshot workspace so the background grader reads stable
+                # files even after the main thread rebuilds the workspace for
+                # the next task.
+                snapshot_result = _snapshot_workspace_for_grading(result)
+                grade_kwargs["execution_result"] = snapshot_result
+
+                # Submit grading to background thread
+                pending_grade_future = judge_executor.submit(grade_task, **grade_kwargs)
+                pending_grade_task = task
+                pending_grade_result = result
+                pending_grade_task_num = i
+                pending_grade_snapshot_dir = snapshot_result.get("_snapshot_tmpdir")
+                logger.info("   Grading submitted to background thread (workspace snapshotted)")
+                # Don't wait - continue to next task
+                # Results will be recorded when we call _wait_for_pending_grade()
+                continue
+            else:
+                # Synchronous grading
+                try:
+                    grade = grade_task(**grade_kwargs)
+                except Exception as exc:
+                    if execution_error:
+                        note = f"Execution failed: {execution_error}; Grading failed: {exc}"
+                    else:
+                        note = f"Grading failed: {exc}"
+                    logger.warning("Task grading failed for %s, continuing: %s", task.task_id, exc)
+                    grade = GradeResult(
+                        task_id=task.task_id,
+                        score=0.0,
+                        max_score=1.0,
+                        grading_type=task.grading_type,
+                        breakdown={},
+                        notes=note,
+                    )
+                task_grades.append(grade)
+
+                # Log score immediately after grading
+                score_pct = grade.score / grade.max_score * 100 if grade.max_score > 0 else 0
+                status_emoji = (
+                    "✅" if grade.score >= grade.max_score else "⚠️" if grade.score > 0 else "❌"
+                )
+                logger.info(
+                    "%s Task %s: %.1f/%.1f (%.0f%%) - %s",
+                    status_emoji,
+                    task.task_id,
+                    grade.score,
+                    grade.max_score,
+                    score_pct,
+                    grade.grading_type,
+                )
+                if grade.notes:
+                    logger.info("   Notes: %s", grade.notes[:200])
+
+                # Log to Axiom
+                axiom.task_complete(
+                    task_id=task.task_id,
+                    task_num=i,
+                    total_tasks=len(tasks_to_run),
+                    score=grade.score,
+                    max_score=grade.max_score,
+                    grading_type=grade.grading_type,
+                    execution_time_sec=result.get("execution_time", 0.0),
+                    timed_out=result.get("timed_out", False),
+                    error=execution_error,
+                )
+
+        # Skip grades_by_task_id update if grading was submitted to background
+        # EXCEPT for sanity task - we need to wait for it to enforce fail-fast
+        if pending_grade_future is not None and pending_grade_task == task:
+            if task.task_id == sanity_task_id and not args.no_fail_fast:
+                # Wait for sanity grade synchronously to check fail-fast
+                _wait_for_pending_grade()
+                # Now task_grades will be empty, but grades_by_task_id is populated
+                # Check fail-fast condition
+                if (
+                    sanity_task_id in grades_by_task_id
+                    and grades_by_task_id[sanity_task_id]["mean"] == 0.0
+                ):
+                    logger.error(
+                        "🚨 FAIL FAST: Sanity check (%s) scored 0%%. Aborting benchmark run to avoid wasting resources.",
+                        sanity_task_id,
+                    )
+                    axiom.sanity_failed(score=grades_by_task_id[sanity_task_id]["mean"])
+                    if judge_executor is not None:
+                        judge_executor.shutdown(wait=False)
+                    sys.exit(3)
+            continue
 
         task_scores = [grade.score for grade in task_grades]
         grades_by_task_id[task.task_id] = {
@@ -906,6 +1143,7 @@ def main():
                 "🚨 FAIL FAST: Sanity check (%s) scored 0%%. Aborting benchmark run to avoid wasting resources.",
                 sanity_task_id,
             )
+            axiom.sanity_failed(score=grades_by_task_id[task.task_id]["mean"])
             sys.exit(3)
         if task.task_id == sanity_task_id and grades_by_task_id[task.task_id]["mean"] == 0.0:
             if all_runs_missing_transcript:
@@ -916,6 +1154,14 @@ def main():
         # Incremental write: update result JSON after each task so partial
         # results are available while the benchmark is still running.
         _write_incremental_results()
+
+    # Wait for any final pending background grade
+    _wait_for_pending_grade()
+
+    # Shutdown the judge executor if we used one
+    if judge_executor is not None:
+        judge_executor.shutdown(wait=True)
+        logger.info("Parallel judge executor shut down")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -948,6 +1194,19 @@ def main():
     score_pct = (total_score / max_score * 100) if max_score > 0 else 0
     logger.info("📊 Final score: %.2f/%.0f (%.1f%%)", total_score, max_score, score_pct)
 
+    # Log judge cache stats
+    if not args.no_judge_cache:
+        cache_stats = get_judge_cache_stats()
+        if cache_stats["hits"] > 0 or cache_stats["misses"] > 0:
+            hit_rate = cache_stats["hits"] / (cache_stats["hits"] + cache_stats["misses"]) * 100
+            logger.info(
+                "📦 Judge cache: %d hits, %d misses (%.0f%% hit rate, %d entries)",
+                cache_stats["hits"],
+                cache_stats["misses"],
+                hit_rate,
+                cache_stats["entries"],
+            )
+
     logger.info("Saved results to %s", output_path)
     _log_category_summary(task_entries, tasks_by_id, category_order)
     _log_efficiency_summary(efficiency, grades_by_task_id)
@@ -965,6 +1224,9 @@ def main():
         except Exception as exc:
             logger.warning("Trend analysis failed: %s", exc)
 
+    submission_id = None
+    leaderboard_url = None
+
     if args.no_upload:
         logger.info("Skipping upload (--no-upload)")
     else:
@@ -974,12 +1236,27 @@ def main():
             result = upload_results(output_path, official_key=args.official_key)
             if result.submission_id:
                 logger.info("Submission ID: %s", result.submission_id)
+                submission_id = result.submission_id
             if result.rank is not None:
                 logger.info("Uploaded to leaderboard: rank #%s", result.rank)
             if result.leaderboard_url:
                 logger.info("View at: %s", result.leaderboard_url)
+                leaderboard_url = result.leaderboard_url
         except UploadError as exc:
             logger.warning("Upload failed: %s", exc)
+            axiom.upload_failed(error=str(exc))
+
+    # Log run completion to Axiom
+    total_time_sec = sum(r.get("execution_time", 0.0) for r in results)
+    axiom.run_complete(
+        overall_score_pct=score_pct,
+        overall_earned=total_score,
+        overall_possible=max_score,
+        total_cost_usd=efficiency.get("total_cost_usd"),
+        total_time_sec=total_time_sec,
+        submission_id=submission_id,
+        leaderboard_url=leaderboard_url,
+    )
 
 
 if __name__ == "__main__":

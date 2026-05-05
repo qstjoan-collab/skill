@@ -4,6 +4,7 @@ PinchBench grading engine.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -20,9 +21,74 @@ from lib_tasks import Task
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_JUDGE_MODEL = "openrouter/anthropic/claude-opus-4.5"
+DEFAULT_JUDGE_MODEL = "openrouter/anthropic/claude-haiku-4.5"
 DEFAULT_JUDGE_AGENT_PREFIX = "bench-judge"
 DEFAULT_JUDGE_TIMEOUT_SECONDS = 300
+
+# Judge result cache: maps cache_key -> GradeResult dict
+# Cache key = hash of (task_id, transcript_summary, rubric, judge_model)
+_judge_cache: Dict[str, Dict[str, Any]] = {}
+_judge_cache_dir: Optional[Path] = None
+
+
+def set_judge_cache_dir(cache_dir: Path) -> None:
+    """Set the directory for persistent judge cache storage."""
+    global _judge_cache_dir
+    _judge_cache_dir = cache_dir
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _load_judge_cache()
+
+
+def _load_judge_cache() -> None:
+    """Load judge cache from disk."""
+    global _judge_cache
+    if _judge_cache_dir is None:
+        return
+    cache_file = _judge_cache_dir / "judge_cache.json"
+    if cache_file.exists():
+        try:
+            _judge_cache = json.loads(cache_file.read_text(encoding="utf-8"))
+            logger.info(f"📦 Loaded judge cache with {len(_judge_cache)} entries")
+        except Exception as e:
+            logger.warning(f"Failed to load judge cache: {e}")
+            _judge_cache = {}
+
+
+def _save_judge_cache() -> None:
+    """Persist judge cache to disk."""
+    if _judge_cache_dir is None:
+        return
+    cache_file = _judge_cache_dir / "judge_cache.json"
+    try:
+        cache_file.write_text(json.dumps(_judge_cache, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to save judge cache: {e}")
+
+
+def _compute_cache_key(task_id: str, transcript: str, rubric: str, model: str) -> str:
+    """Compute a cache key from grading inputs."""
+    content = f"{task_id}|{transcript}|{rubric}|{model}"
+    return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+
+def get_judge_cache_stats() -> Dict[str, int]:
+    """Return cache statistics."""
+    return {
+        "entries": len(_judge_cache),
+        "hits": getattr(get_judge_cache_stats, "_hits", 0),
+        "misses": getattr(get_judge_cache_stats, "_misses", 0),
+    }
+
+
+def clear_judge_cache() -> None:
+    """Clear the in-memory and on-disk judge cache."""
+    global _judge_cache
+    _judge_cache = {}
+    if _judge_cache_dir is not None:
+        cache_file = _judge_cache_dir / "judge_cache.json"
+        if cache_file.exists():
+            cache_file.unlink()
+    logger.info("🗑️  Judge cache cleared")
 
 
 @dataclass
@@ -53,7 +119,7 @@ def grade_task(
     judge_model: str = DEFAULT_JUDGE_MODEL,
     judge_agent_prefix: str = DEFAULT_JUDGE_AGENT_PREFIX,
     judge_timeout_seconds: float = DEFAULT_JUDGE_TIMEOUT_SECONDS,
-    judge_backend: str = "openclaw",
+    judge_backend: str = "api",
     verbose: bool = False,
 ) -> GradeResult:
     grading_type = task.grading_type
@@ -185,7 +251,7 @@ def _grade_llm_judge(
     judge_model: str,
     judge_agent_prefix: str,
     judge_timeout_seconds: float,
-    judge_backend: str = "openclaw",
+    judge_backend: str = "api",
     skill_dir: Optional[Path] = None,
     verbose: bool = False,
 ) -> GradeResult:
@@ -220,6 +286,26 @@ def _grade_llm_judge(
             workspace_content[:500],
         )
     rubric = task.llm_judge_rubric or _format_grading_criteria(task)
+    
+    # Check cache before calling judge
+    cache_key = _compute_cache_key(task.task_id, transcript_summary, rubric, judge_model)
+    if cache_key in _judge_cache:
+        cached = _judge_cache[cache_key]
+        if verbose:
+            logger.info("   [VERBOSE] Cache HIT for %s (key=%s)", task.task_id, cache_key[:8])
+        get_judge_cache_stats._hits = getattr(get_judge_cache_stats, "_hits", 0) + 1
+        return GradeResult(
+            task_id=task.task_id,
+            score=cached["score"],
+            max_score=cached["max_score"],
+            grading_type="llm_judge",
+            breakdown=cached.get("breakdown", {}),
+            notes=cached.get("notes", "") + " [cached]",
+        )
+    get_judge_cache_stats._misses = getattr(get_judge_cache_stats, "_misses", 0) + 1
+    if verbose:
+        logger.info("   [VERBOSE] Cache MISS for %s (key=%s)", task.task_id, cache_key[:8])
+    
     prompt = _build_judge_prompt(task, transcript_summary, rubric, workspace_content)
 
     max_judge_attempts = 2
@@ -304,7 +390,8 @@ def _grade_llm_judge(
             task.task_id,
             raw_parsed,
         )
-    return GradeResult(
+    
+    result = GradeResult(
         task_id=task.task_id,
         score=float(total) if total is not None else 0.0,
         max_score=1.0,
@@ -312,6 +399,18 @@ def _grade_llm_judge(
         breakdown=_normalize_score_dict(breakdown),
         notes=str(notes) if notes is not None else "",
     )
+    
+    # Cache successful results (only if we got a valid score)
+    if total is not None:
+        _judge_cache[cache_key] = {
+            "score": result.score,
+            "max_score": result.max_score,
+            "breakdown": result.breakdown,
+            "notes": result.notes,
+        }
+        _save_judge_cache()
+    
+    return result
 
 
 def _combine_grades(task: Task, auto_result: GradeResult, llm_result: GradeResult) -> GradeResult:
@@ -449,11 +548,14 @@ def _build_judge_prompt(
         workspace_section = f"## Workspace Files Created by Agent\n{workspace_content}\n\n"
     return (
         "You are a grading function. Your ONLY job is to output a single JSON object.\n\n"
-        "CRITICAL RULES:\n"
+        "CRITICAL RULES FOR YOU, THE GRADER (not the agent being graded):\n"
         "- Do NOT use any tools (no Read, Write, exec, or any other tool calls)\n"
         "- Do NOT create files or run commands\n"
         "- Do NOT write any prose, explanation, or commentary outside the JSON\n"
         "- Respond with ONLY a JSON object — nothing else\n\n"
+        "IMPORTANT: The agent being graded may have used tools (read, write, exec, apply_patch, "
+        "todowrite, etc.) during task execution. This is normal and expected. Do NOT treat the "
+        "agent's tool usage as a rule violation — the rules above apply only to you, the grader.\n\n"
         "Be a strict evaluator. Reserve 1.0 for genuinely excellent performance. "
         "An average acceptable completion should score around 0.6-0.7. "
         "Deduct points for unnecessary steps, verbose output, and inefficient tool usage.\n\n"
