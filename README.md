@@ -94,15 +94,16 @@ export PINCHBENCH_OFFICIAL_KEY=your_official_key
 | Flag                     | Description                                                                   |
 | ------------------------ | ----------------------------------------------------------------------------- |
 | `--model MODEL`          | Model to test (e.g., `openrouter/anthropic/claude-sonnet-4`)                  |
-| `--judge MODEL`          | Judge model for LLM grading; uses direct API when set (see below)                 |
+| `--judge MODEL`          | Judge model for LLM grading; uses direct API when set (see below)             |
 | `--suite SUITE`          | `all`, `automated-only`, or comma-separated task IDs                          |
 | `--runs N`               | Number of runs per task for averaging                                         |
 | `--timeout-multiplier N` | Scale timeouts for slower models                                              |
+| `--thinking LEVEL`       | Reasoning depth: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `adaptive` |
 | `--output-dir DIR`       | Where to save results (default: `results/`)                                   |
 | `--no-upload`            | Skip uploading to leaderboard                                                 |
 | `--register`             | Request an API token for submissions                                          |
 | `--upload FILE`          | Upload a previous results JSON                                                |
-| `--official-key KEY`     | Mark submission as official (or use `PINCHBENCH_OFFICIAL_KEY` env var)         |
+| `--official-key KEY`     | Mark submission as official (or use `PINCHBENCH_OFFICIAL_KEY` env var)        |
 
 ### Judge
 
@@ -115,6 +116,9 @@ By default (no `--judge` flag), the LLM judge runs as an OpenClaw agent session.
 # Direct API via OpenRouter
 ./scripts/run.sh --model openai/gpt-4o --judge openrouter/anthropic/claude-sonnet-4-5
 
+# Direct API via Kilo Gateway
+./scripts/run.sh --model openai/gpt-4o --judge kilo/anthropic/claude-sonnet-4-5
+
 # Direct API via Anthropic
 ./scripts/run.sh --model openai/gpt-4o --judge anthropic/claude-sonnet-4-5-20250514
 
@@ -125,7 +129,7 @@ By default (no `--judge` flag), the LLM judge runs as an OpenClaw agent session.
 ./scripts/run.sh --model openai/gpt-4o --judge claude
 ```
 
-Required env vars: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` depending on the judge model prefix.
+Required env vars: `OPENROUTER_API_KEY`, `KILO_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` depending on the judge model prefix.
 
 ## Contributing Tasks
 
@@ -163,4 +167,3 @@ MIT — see [LICENSE](LICENSE) for details.
 ---
 
 _Claw-some AI agent testing_ 🦞
-

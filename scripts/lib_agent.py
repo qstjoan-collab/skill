@@ -33,6 +33,9 @@ class ModelValidationError(Exception):
 MAX_OPENCLAW_MESSAGE_CHARS = int(os.environ.get("PINCHBENCH_MAX_MSG_CHARS", "8000"))
 JUDGE_MAX_MSG_CHARS = int(os.environ.get("PINCHBENCH_JUDGE_MAX_MSG_CHARS", "3000"))
 
+# Valid thinking levels for OpenClaw reasoning depth
+VALID_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "adaptive")
+
 
 def _coerce_subprocess_output(value: Any) -> str:
     if value is None:
@@ -772,10 +775,13 @@ def execute_openclaw_task(
     skill_dir: Path,
     output_dir: Optional[Path] = None,
     verbose: bool = False,
+    thinking_level: Optional[str] = None,
 ) -> Dict[str, Any]:
     logger.info("🤖 Agent [%s] starting task: %s", agent_id, task.task_id)
     logger.info("   Task: %s", task.name)
     logger.info("   Category: %s", task.category)
+    if thinking_level:
+        logger.info("   Thinking: %s", thinking_level)
     if verbose:
         logger.info(
             "   Prompt: %s", task.prompt[:500] + "..." if len(task.prompt) > 500 else task.prompt
@@ -862,6 +868,8 @@ def execute_openclaw_task(
                     ]
                 if use_local:
                     cmd.insert(2, "--local")
+                if thinking_level:
+                    cmd.extend(["--thinking", thinking_level])
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -899,6 +907,8 @@ def execute_openclaw_task(
                 ]
             if use_local:
                 cmd.insert(2, "--local")
+            if thinking_level:
+                cmd.extend(["--thinking", thinking_level])
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -1175,6 +1185,7 @@ def call_judge_api(
 
     Dispatches based on model prefix:
       - openrouter/* -> OpenRouter chat completions API
+      - kilo/*       -> Kilo Gateway chat completions API
       - anthropic/*  -> Anthropic Messages API
       - openai/*     -> OpenAI chat completions API
       - claude       -> headless Claude CLI (claude -p)
@@ -1183,6 +1194,8 @@ def call_judge_api(
     """
     if model == "claude" or model.startswith("claude:"):
         return _judge_via_claude_cli(prompt, model, timeout_seconds)
+    if model.startswith("kilo/"):
+        return _judge_via_kilo(prompt, model, timeout_seconds)
     if model.startswith("anthropic/"):
         return _judge_via_anthropic(prompt, model, timeout_seconds)
     if model.startswith("openai/"):
@@ -1252,6 +1265,20 @@ def _judge_via_openrouter(prompt: str, model: str, timeout_seconds: float) -> Di
         "https://openrouter.ai/api/v1/chat/completions",
         api_key, timeout_seconds,
         extra_headers={"HTTP-Referer": "https://pinchbench.com", "X-Title": "PinchBench-Judge"},
+    )
+
+
+def _judge_via_kilo(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:
+    api_key = os.environ.get("KILO_API_KEY")
+    if not api_key:
+        return {"status": "error", "text": "", "error": "KILO_API_KEY not set"}
+    bare_model = model.removeprefix("kilo/")
+    return _judge_via_openai_compat(
+        prompt,
+        bare_model,
+        "https://api.kilo.ai/api/gateway/chat/completions",
+        api_key,
+        timeout_seconds,
     )
 
 

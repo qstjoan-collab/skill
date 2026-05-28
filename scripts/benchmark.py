@@ -23,6 +23,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -35,6 +36,7 @@ from lib_agent import (
     ModelValidationError,
     slugify_model,
     validate_openrouter_model,
+    VALID_THINKING_LEVELS,
 )
 from lib_axiom import init_axiom
 from lib_grading import (
@@ -237,8 +239,9 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Judge model or backend. Default (unset): OpenClaw agent session with "
-            "openrouter/anthropic/claude-opus-4.5. Set to a model ID to call its API "
-            "directly (e.g. openai/gpt-4o, anthropic/claude-sonnet-4-5-20250514, claude)"
+            "openrouter/anthropic/claude-haiku-4.5. Set to a model ID to call its API "
+            "directly (e.g. kilo/anthropic/claude-sonnet-4-5, openai/gpt-4o, "
+            "anthropic/claude-sonnet-4-5-20250514, claude)"
         ),
     )
     parser.add_argument(
@@ -284,6 +287,12 @@ def _parse_args() -> argparse.Namespace:
         help="Clear the judge cache before running",
     )
     parser.add_argument(
+        "--thinking",
+        type=str,
+        default=None,
+        help="Thinking level for reasoning depth (off, minimal, low, medium, high, xhigh, adaptive)",
+    )
+    parser.add_argument(
         "--trend",
         action="store_true",
         help="Run trend analysis after benchmark completes (requires ≥2 runs in output dir)",
@@ -306,6 +315,13 @@ def _parse_args() -> argparse.Namespace:
     # Validate --trend-window
     if args.trend_window < 2:
         parser.error("--trend-window must be >= 2")
+
+    # Validate --thinking
+    if args.thinking and args.thinking not in VALID_THINKING_LEVELS:
+        parser.error(
+            f"Invalid thinking level '{args.thinking}'. "
+            f"Valid levels: {', '.join(VALID_THINKING_LEVELS)}"
+        )
 
     return args
 
@@ -970,8 +986,26 @@ def main():
         # (we need to record its results before they get overwritten)
         _wait_for_pending_grade()
 
+        # Log task start to Axiom
+        axiom.task_start(
+            task_id=task.task_id,
+            task_num=i,
+            total_tasks=len(tasks_to_run),
+        )
+
         task_grades = []
         task_results = []
+
+        # Start heartbeat thread for this task
+        heartbeat_stop = threading.Event()
+        run_start_time = time.time()
+        def _heartbeat():
+            while not heartbeat_stop.wait(60):
+                uptime_ms = int((time.time() - run_start_time) * 1000)
+                axiom.heartbeat(current_task=task.task_id, uptime_ms=uptime_ms)
+        heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+        heartbeat_thread.start()
+
         for run_index in range(runs_per_task):
             logger.info("\n%s", "=" * 80)
             logger.info(
@@ -993,6 +1027,7 @@ def main():
                     skill_dir=skill_dir,
                     output_dir=Path(args.output_dir) / f"{run_id}_transcripts",
                     verbose=args.verbose,
+                    thinking_level=args.thinking,
                 )
             except Exception as exc:
                 execution_error = str(exc)
@@ -1098,6 +1133,10 @@ def main():
                     timed_out=result.get("timed_out", False),
                     error=execution_error,
                 )
+
+        # Stop heartbeat for this task
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=5)
 
         # Skip grades_by_task_id update if grading was submitted to background
         # EXCEPT for sanity task - we need to wait for it to enforce fail-fast

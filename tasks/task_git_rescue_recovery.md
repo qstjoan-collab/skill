@@ -1,7 +1,7 @@
 ---
 id: task_git_rescue_recovery
 name: Git Rescue / Recovery
-category: developer
+category: coding
 grading_type: automated
 timeout_seconds: 120
 workspace_files: []
@@ -92,6 +92,9 @@ def grade(transcript: list, workspace_path: str) -> dict:
             "git branch -M main",
             "git config user.name 'PinchBench'",
             "git config user.email 'bench@example.com'",
+            # RATIONALE: If user has global GPG signing enabled, this test will fail.
+            # Therefore, override the setting for this repo.
+            "git config commit.gpgsign false",
             "printf 'base\n' > app.txt",
             "git add app.txt",
             "git commit -m 'base commit'",
